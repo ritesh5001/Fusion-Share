@@ -1,5 +1,9 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 
+// ============================================================================
+// TYPES & CONSTANTS
+// ============================================================================
+
 // Message types (must match backend)
 enum MessageType {
     CREATE_ROOM = 'CREATE_ROOM',
@@ -11,32 +15,54 @@ enum MessageType {
     ERROR = 'ERROR'
 }
 
-// Room states
-type RoomState = 'idle' | 'creating' | 'waiting' | 'joining' | 'connected';
+// Explicit app states - only valid transitions allowed
+enum AppState {
+    IDLE = 'IDLE',
+    ROOM_CREATED = 'ROOM_CREATED',    // Sender waiting for receiver
+    ROOM_JOINING = 'ROOM_JOINING',    // Receiver attempting to join
+    CONNECTED = 'CONNECTED',          // Both devices connected
+    ERROR = 'ERROR'                   // Error state (recoverable)
+}
 
-// User role
-type UserRole = 'none' | 'sender' | 'receiver';
+// User roles
+type UserRole = 'sender' | 'receiver' | null;
+
+// Friendly error messages
+const ERROR_MESSAGES: Record<string, string> = {
+    'Room not found': 'Room not found. Please check the code and try again.',
+    'Room is full': 'Room already has a connected device.',
+    'Connection lost': 'Connection lost. Please try again.',
+    'default': 'Something went wrong. Please try again.'
+};
+
+const getFriendlyError = (message: string): string => {
+    return ERROR_MESSAGES[message] || ERROR_MESSAGES['default'];
+};
+
+// ============================================================================
+// COMPONENT
+// ============================================================================
 
 function App() {
-    const [isConnected, setIsConnected] = useState(false);
-    const [roomState, setRoomState] = useState<RoomState>('idle');
+    // Core state
+    const [appState, setAppState] = useState<AppState>(AppState.IDLE);
     const [roomId, setRoomId] = useState<string | null>(null);
-    const [userRole, setUserRole] = useState<UserRole>('none');
-    const [statusMessage, setStatusMessage] = useState<string>('');
-    const [errorMessage, setErrorMessage] = useState<string>('');
+    const [userRole, setUserRole] = useState<UserRole>(null);
+    const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+    // UI state
+    const [isConnected, setIsConnected] = useState(false);
     const [showJoinInput, setShowJoinInput] = useState(false);
     const [joinCode, setJoinCode] = useState('');
 
+    // Refs
     const wsRef = useRef<WebSocket | null>(null);
+    const mountedRef = useRef(false);
 
-    // Send message helper
-    const sendMessage = useCallback((type: MessageType, payload: Record<string, unknown> = {}) => {
-        if (wsRef.current?.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({ type, ...payload }));
-        }
-    }, []);
+    // ============================================================================
+    // WEBSOCKET MESSAGE HANDLER
+    // ============================================================================
 
-    // Handle incoming messages
     const handleMessage = useCallback((event: MessageEvent) => {
         try {
             const message = JSON.parse(event.data);
@@ -45,44 +71,50 @@ function App() {
             switch (message.type) {
                 case MessageType.ROOM_CREATED:
                     setRoomId(message.roomId);
-                    setRoomState('waiting');
+                    setAppState(AppState.ROOM_CREATED);
                     setUserRole('sender');
-                    setStatusMessage('Waiting for another device to join...');
-                    setErrorMessage('');
+                    setErrorMessage(null);
                     break;
 
                 case MessageType.ROOM_JOINED:
                     setRoomId(message.roomId);
-                    setRoomState('connected');
+                    setAppState(AppState.CONNECTED);
                     setUserRole('receiver');
-                    setStatusMessage('Connected to sender');
-                    setErrorMessage('');
+                    setErrorMessage(null);
                     setShowJoinInput(false);
                     setJoinCode('');
                     break;
 
                 case MessageType.PEER_JOINED:
-                    setRoomState('connected');
-                    setStatusMessage('Device connected');
+                    setAppState(AppState.CONNECTED);
+                    setErrorMessage(null);
                     break;
 
                 case MessageType.PEER_DISCONNECTED:
-                    if (userRole === 'sender') {
-                        setRoomState('waiting');
-                        setStatusMessage('Peer disconnected. Waiting for another device...');
-                    } else {
-                        // Receiver's room was closed
-                        setRoomState('idle');
-                        setRoomId(null);
-                        setUserRole('none');
-                        setStatusMessage('');
-                        setErrorMessage(message.message || 'Connection lost');
-                    }
+                    // Sender stays in room, receiver gets kicked
+                    setUserRole((currentRole) => {
+                        if (currentRole === 'sender') {
+                            setAppState(AppState.ROOM_CREATED);
+                        } else {
+                            setAppState(AppState.ERROR);
+                            setRoomId(null);
+                            setErrorMessage('Connection lost. Please try again.');
+                            // Auto-recover to IDLE after showing error
+                            setTimeout(() => setAppState(AppState.IDLE), 100);
+                        }
+                        return currentRole === 'sender' ? 'sender' : null;
+                    });
                     break;
 
                 case MessageType.ERROR:
-                    setErrorMessage(message.message || 'Something went wrong');
-                    setRoomState(roomState === 'creating' ? 'idle' : roomState === 'joining' ? 'idle' : roomState);
+                    setErrorMessage(getFriendlyError(message.message));
+                    // Recover to IDLE if we were attempting an action
+                    setAppState((current) => {
+                        if (current === AppState.ROOM_JOINING) {
+                            return AppState.IDLE;
+                        }
+                        return current;
+                    });
                     break;
 
                 default:
@@ -91,138 +123,218 @@ function App() {
         } catch (error) {
             console.error('Failed to parse message:', error);
         }
-    }, [roomState, userRole]);
+    }, []);
 
-    useEffect(() => {
+    // ============================================================================
+    // WEBSOCKET CONNECTION
+    // ============================================================================
+
+    const connectWebSocket = useCallback(() => {
         const ws = new WebSocket('ws://localhost:8080');
         wsRef.current = ws;
 
         ws.onopen = () => {
             console.log('Connected to server');
             setIsConnected(true);
+            setErrorMessage(null);
         };
 
         ws.onclose = () => {
             console.log('Disconnected from server');
             setIsConnected(false);
-            setRoomState('idle');
-            setRoomId(null);
-            setUserRole('none');
         };
 
         ws.onmessage = handleMessage;
 
         ws.onerror = (error) => {
             console.error('WebSocket error:', error);
+            setErrorMessage('Connection lost. Please try again.');
         };
 
-        return () => {
-            ws.close();
-        };
+        return ws;
     }, [handleMessage]);
 
+    useEffect(() => {
+        // Prevent double connection in Strict Mode
+        if (mountedRef.current) return;
+        mountedRef.current = true;
+
+        connectWebSocket();
+
+        return () => {
+            mountedRef.current = false;
+            wsRef.current?.close();
+        };
+    }, [connectWebSocket]);
+
+    // ============================================================================
+    // ACTIONS
+    // ============================================================================
+
+    const sendMessage = useCallback((type: MessageType, payload: Record<string, unknown> = {}) => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type, ...payload }));
+        }
+    }, []);
+
     const handleCreateRoom = () => {
-        setRoomState('creating');
-        setStatusMessage('Creating room...');
-        setErrorMessage('');
+        // Only allow from IDLE state
+        if (appState !== AppState.IDLE || !isConnected) return;
+
+        setErrorMessage(null);
         sendMessage(MessageType.CREATE_ROOM);
     };
 
     const handleJoinRoom = () => {
+        // Only allow from IDLE state
+        if (appState !== AppState.IDLE || !isConnected) return;
+
         setShowJoinInput(true);
-        setErrorMessage('');
+        setErrorMessage(null);
     };
 
     const handleJoinSubmit = () => {
-        if (!joinCode.trim()) {
+        const code = joinCode.trim().toUpperCase();
+
+        if (!code) {
             setErrorMessage('Please enter a room code');
             return;
         }
-        setRoomState('joining');
-        setStatusMessage('Joining room...');
-        setErrorMessage('');
-        sendMessage(MessageType.JOIN_ROOM, { roomId: joinCode.toUpperCase() });
+
+        if (code.length !== 4) {
+            setErrorMessage('Room code must be 4 characters');
+            return;
+        }
+
+        setAppState(AppState.ROOM_JOINING);
+        setErrorMessage(null);
+        sendMessage(MessageType.JOIN_ROOM, { roomId: code });
     };
 
     const handleCancelJoin = () => {
         setShowJoinInput(false);
         setJoinCode('');
-        setErrorMessage('');
+        setErrorMessage(null);
     };
 
     const handleLeaveRoom = () => {
-        // Close and reconnect to leave room
-        wsRef.current?.close();
-        setRoomState('idle');
+        // Close WebSocket cleanly
+        if (wsRef.current) {
+            wsRef.current.close();
+            wsRef.current = null;
+        }
+
+        // Reset all state to IDLE
+        setAppState(AppState.IDLE);
         setRoomId(null);
-        setUserRole('none');
-        setStatusMessage('');
-        setErrorMessage('');
+        setUserRole(null);
+        setErrorMessage(null);
         setShowJoinInput(false);
         setJoinCode('');
+
+        // Reconnect after brief delay
+        setTimeout(() => {
+            connectWebSocket();
+        }, 100);
     };
 
-    // Render based on room state
-    const renderContent = () => {
-        // Show room code and status when in room
-        if (roomState === 'waiting' || roomState === 'connected') {
-            return (
-                <div className="room-info">
-                    <div className="room-code-container">
-                        <span className="room-code-label">Room Code</span>
-                        <span className="room-code">{roomId}</span>
-                    </div>
-                    <p className="room-status">{statusMessage}</p>
-                    {roomState === 'connected' && (
-                        <div className="role-badge">
-                            {userRole === 'sender' ? '📤 Sender' : '📥 Receiver'}
-                        </div>
-                    )}
-                    <button className="btn btn-secondary" onClick={handleLeaveRoom}>
-                        Leave Room
-                    </button>
-                </div>
-            );
-        }
+    // ============================================================================
+    // STATUS TEXT
+    // ============================================================================
 
-        // Show join room input
+    const getStatusText = (): string => {
+        switch (appState) {
+            case AppState.ROOM_CREATED:
+                return 'Waiting for another device to join...';
+            case AppState.ROOM_JOINING:
+                return 'Joining room...';
+            case AppState.CONNECTED:
+                return userRole === 'sender' ? 'Device connected' : 'Connected to sender';
+            default:
+                return '';
+        }
+    };
+
+    // ============================================================================
+    // RENDER HELPERS
+    // ============================================================================
+
+    const renderRoleBadge = () => {
+        if (!userRole) return null;
+
+        return (
+            <div className="role-badge">
+                {userRole === 'sender' ? '📤 Sender' : '📥 Receiver'}
+            </div>
+        );
+    };
+
+    const renderRoomView = () => (
+        <div className="room-info">
+            <div className="room-code-container">
+                <span className="room-code-label">Room Code</span>
+                <span className="room-code">{roomId}</span>
+            </div>
+
+            {renderRoleBadge()}
+
+            <p className="room-status">{getStatusText()}</p>
+
+            <button
+                className="btn btn-secondary"
+                onClick={handleLeaveRoom}
+            >
+                Leave Room
+            </button>
+        </div>
+    );
+
+    const renderJoinForm = () => (
+        <div className="join-form">
+            <input
+                type="text"
+                className="join-input"
+                placeholder="XXXX"
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                onKeyDown={(e) => e.key === 'Enter' && handleJoinSubmit()}
+                maxLength={4}
+                autoFocus
+                disabled={appState === AppState.ROOM_JOINING}
+            />
+            <div className="join-actions">
+                <button
+                    className="btn btn-primary"
+                    onClick={handleJoinSubmit}
+                    disabled={!joinCode.trim() || appState === AppState.ROOM_JOINING}
+                >
+                    {appState === AppState.ROOM_JOINING ? 'Joining...' : 'Join'}
+                </button>
+                <button
+                    className="btn btn-secondary"
+                    onClick={handleCancelJoin}
+                    disabled={appState === AppState.ROOM_JOINING}
+                >
+                    Cancel
+                </button>
+            </div>
+        </div>
+    );
+
+    const renderIdleView = () => {
+        // Show join form if active
         if (showJoinInput) {
-            return (
-                <div className="join-form">
-                    <input
-                        type="text"
-                        className="join-input"
-                        placeholder="Enter room code"
-                        value={joinCode}
-                        onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                        maxLength={4}
-                        autoFocus
-                    />
-                    <div className="join-actions">
-                        <button
-                            className="btn btn-primary"
-                            onClick={handleJoinSubmit}
-                            disabled={!joinCode.trim()}
-                        >
-                            Join
-                        </button>
-                        <button className="btn btn-secondary" onClick={handleCancelJoin}>
-                            Cancel
-                        </button>
-                    </div>
-                </div>
-            );
+            return renderJoinForm();
         }
 
-        // Show create/join buttons
         return (
             <div className="actions">
                 <button
                     className="btn btn-primary"
                     onClick={handleCreateRoom}
-                    disabled={!isConnected || roomState === 'creating'}
+                    disabled={!isConnected}
                 >
-                    {roomState === 'creating' ? 'Creating...' : 'Create Room'}
+                    Create Room
                 </button>
                 <button
                     className="btn btn-secondary"
@@ -235,6 +347,26 @@ function App() {
         );
     };
 
+    const renderContent = () => {
+        switch (appState) {
+            case AppState.ROOM_CREATED:
+            case AppState.CONNECTED:
+                return renderRoomView();
+
+            case AppState.ROOM_JOINING:
+                return renderJoinForm();
+
+            case AppState.IDLE:
+            case AppState.ERROR:
+            default:
+                return renderIdleView();
+        }
+    };
+
+    // ============================================================================
+    // MAIN RENDER
+    // ============================================================================
+
     return (
         <div className="container">
             <header className="header">
@@ -243,14 +375,16 @@ function App() {
             </header>
 
             <div className="status">
-                <span className={`status-dot ${isConnected ? 'connected' : 'disconnected'}`}></span>
+                <span className={`status-dot ${isConnected ? 'connected' : 'disconnected'}`} />
                 <span className="status-text">
-                    {isConnected ? 'Connected' : 'Disconnected'}
+                    {isConnected ? 'Connected' : 'Connecting...'}
                 </span>
             </div>
 
             {errorMessage && (
-                <div className="error-message">{errorMessage}</div>
+                <div className="error-message" role="alert">
+                    {errorMessage}
+                </div>
             )}
 
             <main className="main-content">
