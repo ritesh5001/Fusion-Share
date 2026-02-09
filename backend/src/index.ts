@@ -4,13 +4,19 @@ const PORT = 8080;
 
 // Message types
 enum MessageType {
+    // Room management
     CREATE_ROOM = 'CREATE_ROOM',
     JOIN_ROOM = 'JOIN_ROOM',
     ROOM_CREATED = 'ROOM_CREATED',
     ROOM_JOINED = 'ROOM_JOINED',
     PEER_JOINED = 'PEER_JOINED',
     PEER_DISCONNECTED = 'PEER_DISCONNECTED',
-    ERROR = 'ERROR'
+    ERROR = 'ERROR',
+
+    // WebRTC signaling (relay only - no inspection)
+    RTC_OFFER = 'RTC_OFFER',
+    RTC_ANSWER = 'RTC_ANSWER',
+    ICE_CANDIDATE = 'ICE_CANDIDATE'
 }
 
 // Room structure
@@ -46,6 +52,16 @@ function sendMessage(ws: WebSocket, type: MessageType, payload: Record<string, u
     }
 }
 
+// Get the peer socket in a room
+function getPeerSocket(ws: WebSocket, room: Room): WebSocket | null {
+    if (room.sender === ws) {
+        return room.receiver;
+    } else if (room.receiver === ws) {
+        return room.sender;
+    }
+    return null;
+}
+
 const wss = new WebSocketServer({ port: PORT });
 
 console.log(`WebSocket server running on port ${PORT}`);
@@ -56,7 +72,7 @@ wss.on('connection', (ws: WebSocket) => {
     ws.on('message', (data: Buffer) => {
         try {
             const message = JSON.parse(data.toString());
-            console.log('Received:', message);
+            console.log('Received:', message.type);
 
             switch (message.type) {
                 case MessageType.CREATE_ROOM: {
@@ -118,6 +134,73 @@ wss.on('connection', (ws: WebSocket) => {
 
                     // Notify sender that receiver connected
                     sendMessage(room.sender, MessageType.PEER_JOINED, { roomId: room.roomId });
+                    break;
+                }
+
+                // ============================================
+                // WebRTC Signaling Relay (dumb relay - no inspection)
+                // ============================================
+
+                case MessageType.RTC_OFFER: {
+                    const roomId = socketToRoom.get(ws);
+                    if (!roomId) {
+                        console.log('RTC_OFFER: Socket not in a room');
+                        break;
+                    }
+
+                    const room = rooms.get(roomId);
+                    if (!room) {
+                        console.log('RTC_OFFER: Room not found');
+                        break;
+                    }
+
+                    const peer = getPeerSocket(ws, room);
+                    if (peer) {
+                        console.log(`Relaying RTC_OFFER in room ${roomId}`);
+                        sendMessage(peer, MessageType.RTC_OFFER, { sdp: message.sdp });
+                    }
+                    break;
+                }
+
+                case MessageType.RTC_ANSWER: {
+                    const roomId = socketToRoom.get(ws);
+                    if (!roomId) {
+                        console.log('RTC_ANSWER: Socket not in a room');
+                        break;
+                    }
+
+                    const room = rooms.get(roomId);
+                    if (!room) {
+                        console.log('RTC_ANSWER: Room not found');
+                        break;
+                    }
+
+                    const peer = getPeerSocket(ws, room);
+                    if (peer) {
+                        console.log(`Relaying RTC_ANSWER in room ${roomId}`);
+                        sendMessage(peer, MessageType.RTC_ANSWER, { sdp: message.sdp });
+                    }
+                    break;
+                }
+
+                case MessageType.ICE_CANDIDATE: {
+                    const roomId = socketToRoom.get(ws);
+                    if (!roomId) {
+                        console.log('ICE_CANDIDATE: Socket not in a room');
+                        break;
+                    }
+
+                    const room = rooms.get(roomId);
+                    if (!room) {
+                        console.log('ICE_CANDIDATE: Room not found');
+                        break;
+                    }
+
+                    const peer = getPeerSocket(ws, room);
+                    if (peer) {
+                        console.log(`Relaying ICE_CANDIDATE in room ${roomId}`);
+                        sendMessage(peer, MessageType.ICE_CANDIDATE, { candidate: message.candidate });
+                    }
                     break;
                 }
 
