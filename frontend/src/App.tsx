@@ -158,6 +158,11 @@ function App() {
     const mountedRef = useRef(false);
     const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
     const scannerRef = useRef<Html5QrcodeScanner | null>(null);
+    const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const reconnectAttemptsRef = useRef(0);
+    const MAX_RECONNECT_ATTEMPTS = 30;
+    const BASE_RECONNECT_DELAY = 1000; // 1 second
+    const MAX_RECONNECT_DELAY = 30000; // 30 seconds
 
     // Wake Lock
     const wakeLock = useWakeLock();
@@ -692,13 +697,53 @@ function App() {
     // ============================================================================
 
     const connectWebSocket = useCallback(() => {
+        // Clear any pending reconnect timer
+        if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
+        }
+
         const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8080';
+        log(`Connecting to WebSocket: ${wsUrl}`);
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
-        ws.onopen = () => { setIsConnected(true); setErrorMessage(null); };
-        ws.onclose = () => setIsConnected(false);
+
+        ws.onopen = () => {
+            log('WebSocket connected');
+            setIsConnected(true);
+            setErrorMessage(null);
+            reconnectAttemptsRef.current = 0; // Reset on successful connection
+        };
+
+        ws.onclose = () => {
+            log('WebSocket disconnected');
+            setIsConnected(false);
+
+            // Auto-reconnect with exponential backoff
+            if (mountedRef.current && reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS) {
+                const delay = Math.min(
+                    BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttemptsRef.current),
+                    MAX_RECONNECT_DELAY
+                );
+                reconnectAttemptsRef.current++;
+                log(`Reconnecting in ${delay}ms (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
+                reconnectTimerRef.current = setTimeout(() => {
+                    if (mountedRef.current) {
+                        connectWebSocket();
+                    }
+                }, delay);
+            } else if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+                log('Max reconnect attempts reached');
+                setErrorMessage('Unable to connect to server. Please refresh the page.');
+            }
+        };
+
         ws.onmessage = handleMessage;
-        ws.onerror = () => setErrorMessage('Connection lost.');
+        ws.onerror = () => {
+            log('WebSocket error');
+            // onclose will fire after onerror, so reconnection is handled there
+        };
+
         return ws;
     }, [handleMessage]);
 
@@ -706,7 +751,15 @@ function App() {
         if (mountedRef.current) return;
         mountedRef.current = true;
         connectWebSocket();
-        return () => { mountedRef.current = false; cleanupWebRTC(); wsRef.current?.close(); };
+        return () => {
+            mountedRef.current = false;
+            if (reconnectTimerRef.current) {
+                clearTimeout(reconnectTimerRef.current);
+                reconnectTimerRef.current = null;
+            }
+            cleanupWebRTC();
+            wsRef.current?.close();
+        };
     }, [connectWebSocket, cleanupWebRTC]);
 
     // ============================================================================
