@@ -306,6 +306,32 @@ html, body {
   opacity: 0.8;
 }
 
+/* Progress Bar */
+.progress-container {
+  width: 100%;
+  max-width: 20rem;
+  height: 0.5rem;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 1rem;
+  overflow: hidden;
+  margin: 1rem 0;
+  position: relative;
+}
+
+.progress-bar {
+  height: 100%;
+  background: var(--success);
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  position: absolute;
+  top: -1.5rem;
+  right: 0;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
 /* WebRTC connection status */
 .webrtc-status {
   display: flex;

@@ -27,7 +27,8 @@ enum AppState {
     ROOM_CREATED = 'ROOM_CREATED',
     ROOM_JOINING = 'ROOM_JOINING',
     CONNECTED = 'CONNECTED',
-    ERROR = 'ERROR'
+    ERROR = 'ERROR',
+    TRANSFERRING = 'TRANSFERRING'
 }
 
 // User roles
@@ -36,10 +37,49 @@ type UserRole = 'sender' | 'receiver' | null;
 // File Metadata
 interface FileMeta {
     type: 'FILE_META';
+    fileId: string;
     name: string;
     size: number;
     mimeType: string;
+    chunkSize: number;
+    totalChunks: number;
 }
+
+// Chunk Message
+interface ChunkMessage {
+    type: 'FILE_CHUNK';
+    fileId: string;
+    index: number;
+    data: string; // Base64 encoded
+}
+
+// Ack Message
+interface AckMessage {
+    type: 'CHUNK_ACK';
+    fileId: string;
+    index: number;
+}
+
+// Resume Request
+interface ResumeRequest {
+    type: 'RESUME_REQUEST';
+    fileId: string;
+    lastReceivedChunk: number;
+}
+
+// Transfer State
+interface TransferState {
+    fileId: string;
+    fileName: string;
+    fileSize: number;
+    totalChunks: number;
+    chunks: (string | ArrayBuffer | null)[]; // Allow null for memory clearing
+    currentChunkIndex: number;
+    startTime: number;
+}
+
+const CHUNK_SIZE = 16 * 1024; // 16KB safe chunk size
+const DATA_CHANNEL_NAME = 'fusion-share';
 
 // Friendly error messages
 const ERROR_MESSAGES: Record<string, string> = {
@@ -53,7 +93,7 @@ const getFriendlyError = (message: string): string => {
     return ERROR_MESSAGES[message] || ERROR_MESSAGES['default'];
 };
 
-// WebRTC configuration (STUN servers for NAT traversal)
+// WebRTC configuration
 const RTC_CONFIG: RTCConfiguration = {
     iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
@@ -61,7 +101,8 @@ const RTC_CONFIG: RTCConfiguration = {
     ]
 };
 
-const DATA_CHANNEL_NAME = 'fusion-share';
+// Helper to generate UUID
+const generateId = () => Math.random().toString(36).substring(2, 15);
 
 // ============================================================================
 // COMPONENT
@@ -79,6 +120,8 @@ function App() {
     const [showJoinInput, setShowJoinInput] = useState(false);
     const [joinCode, setJoinCode] = useState('');
     const [statusMessage, setStatusMessage] = useState<string>('');
+    const [progress, setProgress] = useState<number>(0);
+    const [canResume, setCanResume] = useState(false);
 
     // WebRTC state
     const [isWebRTCConnected, setIsWebRTCConnected] = useState(false);
@@ -89,12 +132,38 @@ function App() {
     const dataChannelRef = useRef<RTCDataChannel | null>(null);
     const mountedRef = useRef(false);
     const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
-    const incomingFileMetaRef = useRef<FileMeta | null>(null);
+
+    // Transfer Refs
+    const transferRef = useRef<TransferState | null>(null);
     const fileInputRef = useRef<HTMLInputElement | null>(null);
 
     // ============================================================================
-    // WEBSOCKET SEND HELPER
+    // UTILITIES
     // ============================================================================
+
+    const log = (message: string, ...args: unknown[]) => {
+        console.log(`[FusionShare] ${message}`, ...args);
+    };
+
+    const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+        return window.btoa(binary);
+    };
+
+    const base64ToArrayBuffer = (base64: string): ArrayBuffer => {
+        const binary_string = window.atob(base64);
+        const len = binary_string.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binary_string.charCodeAt(i);
+        }
+        return bytes.buffer;
+    };
 
     const sendWsMessage = useCallback((type: MessageType | string, payload: Record<string, unknown> = {}) => {
         if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -106,120 +175,311 @@ function App() {
     // FILE TRANSFER LOGIC
     // ============================================================================
 
+    /**
+     * Prepares file for transfer by splitting into chunks
+     */
     const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
         const file = event.target.files?.[0];
         if (!file || !dataChannelRef.current || dataChannelRef.current.readyState !== 'open') return;
 
-        setStatusMessage(`Sending ${file.name}...`);
-
-        try {
-            // 1. Send Metadata
-            const meta: FileMeta = {
-                type: 'FILE_META',
-                name: file.name,
-                size: file.size,
-                mimeType: file.type
-            };
-
-            console.log('[FileTransfer] Sending metadata:', meta);
-            dataChannelRef.current.send(JSON.stringify(meta));
-
-            // 2. Read and Send File Content
-            const buffer = await file.arrayBuffer();
-            console.log(`[FileTransfer] Sending ${buffer.byteLength} bytes`);
-            dataChannelRef.current.send(buffer);
-
-            setStatusMessage(`Sent ${file.name} successfully!`);
-            console.log('[FileTransfer] File sent successfully');
-
-            // Reset input
-            if (fileInputRef.current) fileInputRef.current.value = '';
-
-        } catch (error) {
-            console.error('[FileTransfer] Error sending file:', error);
-            setStatusMessage('Error sending file');
-            setErrorMessage('Failed to send file. Please try again.');
-        }
-    };
-
-    const handleIncomingData = useCallback((data: string | ArrayBuffer) => {
-        // Handle Metadata (JSON string)
-        if (typeof data === 'string') {
-            try {
-                const message = JSON.parse(data);
-                if (message.type === 'FILE_META') {
-                    console.log('[FileTransfer] Received metadata:', message);
-                    incomingFileMetaRef.current = message;
-                    setStatusMessage(`Receiving ${message.name}...`);
-                }
-            } catch (e) {
-                // Ignore non-JSON text messages (like hello messages)
-                console.log(`[WebRTC] Text message: "${data}"`);
-            }
+        // Prevent simultaneous transfers
+        if (appState === AppState.TRANSFERRING) {
+            log('Transfer already in progress');
             return;
         }
 
-        // Handle File Content (ArrayBuffer)
-        if (data instanceof ArrayBuffer) {
-            const meta = incomingFileMetaRef.current;
-            if (!meta) {
-                console.error('[FileTransfer] Received data without metadata');
+        setProgress(0);
+        setCanResume(false);
+        setAppState(AppState.TRANSFERRING);
+        setStatusMessage(`Preparing ${file.name}...`);
+
+        try {
+            const buffer = await file.arrayBuffer();
+            const totalChunks = Math.ceil(buffer.byteLength / CHUNK_SIZE);
+            const fileId = generateId();
+
+            // Prepare chunks (Memory intensive, but simple for now)
+            const chunks: string[] = [];
+            for (let i = 0; i < totalChunks; i++) {
+                const start = i * CHUNK_SIZE;
+                const end = Math.min(start + CHUNK_SIZE, buffer.byteLength);
+                const chunk = buffer.slice(start, end);
+                chunks.push(arrayBufferToBase64(chunk));
+            }
+
+            // Initialize transfer state
+            transferRef.current = {
+                fileId,
+                fileName: file.name,
+                fileSize: file.size,
+                totalChunks,
+                chunks,
+                currentChunkIndex: 0,
+                startTime: Date.now()
+            };
+
+            // Send Metadata
+            const meta: FileMeta = {
+                type: 'FILE_META',
+                fileId,
+                name: file.name,
+                size: file.size,
+                mimeType: file.type,
+                chunkSize: CHUNK_SIZE,
+                totalChunks
+            };
+
+            log('Sending metadata', meta);
+            dataChannelRef.current.send(JSON.stringify(meta));
+
+            // Start sending chunks
+            sendNextChunk();
+
+        } catch (error) {
+            console.error('[FusionShare] Error preparing file:', error);
+            setStatusMessage('Error preparing file');
+            setAppState(AppState.CONNECTED);
+        }
+    };
+
+    /**
+     * Sends the next chunk in the queue
+     */
+    const sendNextChunk = () => {
+        const transfer = transferRef.current;
+        if (!transfer || !dataChannelRef.current) return;
+
+        // Check for completion
+        if (transfer.currentChunkIndex >= transfer.totalChunks) {
+            log('Transfer complete');
+            setStatusMessage(`Sent ${transfer.fileName} successfully!`);
+            setAppState(AppState.CONNECTED);
+            if (fileInputRef.current) fileInputRef.current.value = '';
+
+            // Cleanup memory (chunks array is already mostly nullified by now)
+            transfer.chunks = [];
+            return;
+        }
+
+        const chunkIndex = transfer.currentChunkIndex;
+
+        // Memory optimization: Free previous chunk as it's been acknowledged
+        if (chunkIndex > 0) {
+            transfer.chunks[chunkIndex - 1] = null;
+        }
+
+        const chunkData = transfer.chunks[chunkIndex] as string;
+
+        // Verify chunk exists (in case of resume logic quirks)
+        if (!chunkData) {
+            console.error('[FusionShare] Chunk data missing for index', chunkIndex);
+            return;
+        }
+
+        const message: ChunkMessage = {
+            type: 'FILE_CHUNK',
+            fileId: transfer.fileId,
+            index: chunkIndex,
+            data: chunkData
+        };
+
+        try {
+            dataChannelRef.current.send(JSON.stringify(message));
+
+            // Update UI
+            const percent = Math.round(((chunkIndex + 1) / transfer.totalChunks) * 100);
+            setProgress(percent);
+            setStatusMessage(`Sending... ${percent}%`);
+        } catch (e) {
+            console.error('[FusionShare] Failed to send chunk', e);
+            setCanResume(true);
+            setStatusMessage('Transfer interrupted');
+        }
+    };
+
+    /**
+     * Handles incoming DataChannel messages
+     */
+    const handleIncomingData = useCallback((data: string) => {
+        try {
+            const message = JSON.parse(data);
+
+            // ----------------------------------------
+            // SENDER: Handle ACK and Resume
+            // ----------------------------------------
+            if (message.type === 'CHUNK_ACK') {
+                const ack = message as AckMessage;
+                const transfer = transferRef.current;
+
+                if (transfer && transfer.fileId === ack.fileId) {
+                    if (ack.index === transfer.currentChunkIndex) {
+                        transfer.currentChunkIndex++;
+                        sendNextChunk();
+                    }
+                }
                 return;
             }
 
-            console.log(`[FileTransfer] Received ${data.byteLength} bytes`);
+            if (message.type === 'RESUME_REQUEST') {
+                const req = message as ResumeRequest;
+                const transfer = transferRef.current;
 
-            // Create Blob and trigger download
-            const blob = new Blob([data], { type: meta.mimeType });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = meta.name;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
+                if (transfer && transfer.fileId === req.fileId) {
+                    log(`Resuming from chunk ${req.lastReceivedChunk + 1}`);
+                    transfer.currentChunkIndex = req.lastReceivedChunk + 1;
+                    sendNextChunk();
+                }
+                return;
+            }
 
-            setStatusMessage(`Received ${meta.name} successfully!`);
-            console.log('[FileTransfer] File saved');
+            // ----------------------------------------
+            // RECEIVER: Handle Meta and Chunks
+            // ----------------------------------------
 
-            // Reset metadata
-            incomingFileMetaRef.current = null;
+            if (message.type === 'FILE_META') {
+                const meta = message as FileMeta;
+
+                // Prevent duplicate transfers
+                if (transferRef.current) {
+                    log('Ignoring new transfer request while busy');
+                    return;
+                }
+
+                log('Received metadata', meta);
+
+                transferRef.current = {
+                    fileId: meta.fileId,
+                    fileName: meta.name,
+                    fileSize: meta.size,
+                    totalChunks: meta.totalChunks,
+                    chunks: [],
+                    currentChunkIndex: 0,
+                    startTime: Date.now()
+                };
+
+                setAppState(AppState.TRANSFERRING);
+                setProgress(0);
+                setStatusMessage(`Receiving ${meta.name}...`);
+                return;
+            }
+
+            if (message.type === 'FILE_CHUNK') {
+                const chunk = message as ChunkMessage;
+                const transfer = transferRef.current;
+
+                if (!transfer || transfer.fileId !== chunk.fileId) return;
+
+                // Validate order
+                if (chunk.index !== transfer.currentChunkIndex) {
+                    console.warn(`[FusionShare] Out of order chunk. Expected ${transfer.currentChunkIndex}, got ${chunk.index}`);
+                    return;
+                }
+
+                // Decode and store
+                const buffer = base64ToArrayBuffer(chunk.data);
+                transfer.chunks.push(buffer);
+                transfer.currentChunkIndex++;
+
+                // Update UI
+                const percent = Math.round((transfer.currentChunkIndex / transfer.totalChunks) * 100);
+                setProgress(percent);
+                setStatusMessage(`Receiving... ${percent}%`);
+
+                // Send ACK
+                const ack: AckMessage = {
+                    type: 'CHUNK_ACK',
+                    fileId: transfer.fileId,
+                    index: chunk.index
+                };
+                dataChannelRef.current?.send(JSON.stringify(ack));
+
+                // Check completion
+                if (transfer.currentChunkIndex >= transfer.totalChunks) {
+                    log('File received completely');
+
+                    try {
+                        const blob = new Blob(transfer.chunks as ArrayBuffer[], { type: 'application/octet-stream' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = transfer.fileName;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+
+                        setStatusMessage(`Received ${transfer.fileName} successfully!`);
+                    } catch (e) {
+                        console.error('[FusionShare] File save error', e);
+                        setStatusMessage('Error saving file');
+                    }
+
+                    setAppState(AppState.CONNECTED);
+                    transferRef.current = null; // Clear memory
+                }
+                return;
+            }
+
+        } catch (e) {
+            console.error('[FusionShare] Error parsing message:', e);
         }
     }, []);
 
+    const handleResume = () => {
+        const transfer = transferRef.current;
+        if (!transfer || !dataChannelRef.current) return;
+
+        if (userRole === 'receiver') {
+            const lastChunk = transfer.currentChunkIndex - 1;
+            const req: ResumeRequest = {
+                type: 'RESUME_REQUEST',
+                fileId: transfer.fileId,
+                lastReceivedChunk: lastChunk
+            };
+            log('Requesting resume', req);
+            dataChannelRef.current.send(JSON.stringify(req));
+            setCanResume(false);
+        }
+
+        if (userRole === 'sender') {
+            log('Retrying current chunk...');
+            sendNextChunk();
+            setCanResume(false);
+        }
+    };
+
     // ============================================================================
-    // WEBRTC SETUP
+    // WEBRTC LIFECYCLE
     // ============================================================================
 
     const cleanupWebRTC = useCallback(() => {
-        console.log('[WebRTC] Cleaning up...');
-
+        log('Cleaning up WebRTC');
         if (dataChannelRef.current) {
             dataChannelRef.current.close();
-            dataChannelRef.current = null;
         }
-
         if (peerConnectionRef.current) {
             peerConnectionRef.current.close();
-            peerConnectionRef.current = null;
         }
 
+        transferRef.current = null;
         pendingCandidatesRef.current = [];
-        incomingFileMetaRef.current = null;
         setIsWebRTCConnected(false);
-        setStatusMessage('');
+        setAppState((prev) => prev === AppState.TRANSFERRING ? AppState.CONNECTED : prev);
     }, []);
 
     const setupDataChannel = useCallback((channel: RTCDataChannel, role: 'sender' | 'receiver') => {
-        console.log(`[WebRTC] Setting up DataChannel as ${role}`);
+        log(`Setting up DataChannel as ${role}`);
         dataChannelRef.current = channel;
-        channel.binaryType = 'arraybuffer'; // Critical for file transfer
 
         channel.onopen = () => {
-            console.log('[WebRTC] DataChannel opened');
+            log('DataChannel opened');
             setIsWebRTCConnected(true);
-            setStatusMessage('Ready to transfer files');
+
+            if (transferRef.current && role === 'receiver') {
+                log('Connection restored, can resume');
+                setCanResume(true);
+                setStatusMessage('Connection restored. Click Resume to continue.');
+            }
         };
 
         channel.onmessage = (event) => {
@@ -227,45 +487,29 @@ function App() {
         };
 
         channel.onclose = () => {
-            console.log('[WebRTC] DataChannel closed');
+            log('DataChannel closed');
             setIsWebRTCConnected(false);
-            setStatusMessage('');
-        };
-
-        channel.onerror = (error) => {
-            console.error('[WebRTC] DataChannel error:', error);
-            setErrorMessage('Data channel error');
+            if (transferRef.current) {
+                setCanResume(true);
+                setStatusMessage('Transfer paused (Connection lost)');
+            }
         };
     }, [handleIncomingData]);
 
     const createPeerConnection = useCallback((role: 'sender' | 'receiver') => {
-        console.log(`[WebRTC] Creating PeerConnection as ${role}`);
-
         const pc = new RTCPeerConnection(RTC_CONFIG);
         peerConnectionRef.current = pc;
 
-        // ICE candidate handling
         pc.onicecandidate = (event) => {
             if (event.candidate) {
-                console.log('[WebRTC] ICE candidate generated, sending...');
                 sendWsMessage(MessageType.ICE_CANDIDATE, {
                     candidate: event.candidate.toJSON()
                 });
             }
         };
 
-        pc.oniceconnectionstatechange = () => {
-            console.log(`[WebRTC] ICE connection state: ${pc.iceConnectionState}`);
-        };
-
-        pc.onconnectionstatechange = () => {
-            console.log(`[WebRTC] Connection state: ${pc.connectionState}`);
-        };
-
-        // Receiver listens for incoming data channel
         if (role === 'receiver') {
             pc.ondatachannel = (event) => {
-                console.log('[WebRTC] Received DataChannel from sender');
                 setupDataChannel(event.channel, 'receiver');
             };
         }
@@ -273,21 +517,18 @@ function App() {
         return pc;
     }, [sendWsMessage, setupDataChannel]);
 
+    // ============================================================================
+    // SIGNALING HANDLERS
+    // ============================================================================
+
     const initiateSenderConnection = useCallback(async () => {
-        console.log('[WebRTC] Sender initiating connection...');
-
         const pc = createPeerConnection('sender');
-
-        // Create data channel
         const channel = pc.createDataChannel(DATA_CHANNEL_NAME);
         setupDataChannel(channel, 'sender');
 
-        // Create and send offer
         try {
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-
-            console.log('[WebRTC] Offer created, sending via WebSocket...');
             sendWsMessage(MessageType.RTC_OFFER, { sdp: offer });
         } catch (error) {
             console.error('[WebRTC] Failed to create offer:', error);
@@ -295,23 +536,15 @@ function App() {
     }, [createPeerConnection, setupDataChannel, sendWsMessage]);
 
     const handleRTCOffer = useCallback(async (sdp: RTCSessionDescriptionInit) => {
-        console.log('[WebRTC] Received offer, creating answer...');
-
         const pc = createPeerConnection('receiver');
-
         try {
             await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-
-            // Add any pending ICE candidates
             for (const candidate of pendingCandidatesRef.current) {
                 await pc.addIceCandidate(new RTCIceCandidate(candidate));
             }
             pendingCandidatesRef.current = [];
-
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
-
-            console.log('[WebRTC] Answer created, sending via WebSocket...');
             sendWsMessage(MessageType.RTC_ANSWER, { sdp: answer });
         } catch (error) {
             console.error('[WebRTC] Failed to handle offer:', error);
@@ -319,400 +552,203 @@ function App() {
     }, [createPeerConnection, sendWsMessage]);
 
     const handleRTCAnswer = useCallback(async (sdp: RTCSessionDescriptionInit) => {
-        console.log('[WebRTC] Received answer, setting remote description...');
-
         const pc = peerConnectionRef.current;
-        if (!pc) {
-            console.error('[WebRTC] No peer connection for answer');
-            return;
-        }
-
+        if (!pc) return;
         try {
             await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-
-            // Add any pending ICE candidates
             for (const candidate of pendingCandidatesRef.current) {
                 await pc.addIceCandidate(new RTCIceCandidate(candidate));
             }
             pendingCandidatesRef.current = [];
-
-            console.log('[WebRTC] Remote description set successfully');
         } catch (error) {
             console.error('[WebRTC] Failed to set remote description:', error);
         }
     }, []);
 
     const handleICECandidate = useCallback(async (candidate: RTCIceCandidateInit) => {
-        console.log('[WebRTC] Received ICE candidate');
-
         const pc = peerConnectionRef.current;
         if (!pc || !pc.remoteDescription) {
-            // Queue candidate if we don't have remote description yet
-            console.log('[WebRTC] Queuing ICE candidate (no remote description yet)');
             pendingCandidatesRef.current.push(candidate);
             return;
         }
-
-        try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-            console.log('[WebRTC] ICE candidate added');
-        } catch (error) {
-            console.error('[WebRTC] Failed to add ICE candidate:', error);
-        }
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
     }, []);
-
-    // ============================================================================
-    // WEBSOCKET MESSAGE HANDLER
-    // ============================================================================
 
     const handleMessage = useCallback((event: MessageEvent) => {
         try {
             const message = JSON.parse(event.data);
-            console.log('Received:', message.type);
-
             switch (message.type) {
                 case MessageType.ROOM_CREATED:
                     setRoomId(message.roomId);
                     setAppState(AppState.ROOM_CREATED);
                     setUserRole('sender');
-                    setErrorMessage(null);
                     break;
-
                 case MessageType.ROOM_JOINED:
                     setRoomId(message.roomId);
                     setAppState(AppState.CONNECTED);
                     setUserRole('receiver');
-                    setErrorMessage(null);
                     setShowJoinInput(false);
-                    setJoinCode('');
-                    // Receiver waits for offer from sender
                     break;
-
                 case MessageType.PEER_JOINED:
                     setAppState(AppState.CONNECTED);
-                    setErrorMessage(null);
-                    // Sender initiates WebRTC connection when peer joins
                     initiateSenderConnection();
                     break;
-
                 case MessageType.PEER_DISCONNECTED:
                     cleanupWebRTC();
-                    setUserRole((currentRole) => {
-                        if (currentRole === 'sender') {
-                            setAppState(AppState.ROOM_CREATED);
-                        } else {
+                    setUserRole((role) => {
+                        if (role === 'sender') setAppState(AppState.ROOM_CREATED);
+                        else {
                             setAppState(AppState.ERROR);
                             setRoomId(null);
-                            setErrorMessage('Connection lost. Please try again.');
+                            setErrorMessage('Connection lost.');
                             setTimeout(() => setAppState(AppState.IDLE), 100);
                         }
-                        return currentRole === 'sender' ? 'sender' : null;
+                        return role === 'sender' ? 'sender' : null;
                     });
                     break;
-
                 case MessageType.ERROR:
                     setErrorMessage(getFriendlyError(message.message));
-                    setAppState((current) => {
-                        if (current === AppState.ROOM_JOINING) {
-                            return AppState.IDLE;
-                        }
-                        return current;
-                    });
+                    setAppState((cur) => cur === AppState.ROOM_JOINING ? AppState.IDLE : cur);
                     break;
-
-                // WebRTC signaling
-                case MessageType.RTC_OFFER:
-                    handleRTCOffer(message.sdp);
-                    break;
-
-                case MessageType.RTC_ANSWER:
-                    handleRTCAnswer(message.sdp);
-                    break;
-
-                case MessageType.ICE_CANDIDATE:
-                    handleICECandidate(message.candidate);
-                    break;
-
-                default:
-                    console.log('Unknown message type:', message.type);
+                case MessageType.RTC_OFFER: handleRTCOffer(message.sdp); break;
+                case MessageType.RTC_ANSWER: handleRTCAnswer(message.sdp); break;
+                case MessageType.ICE_CANDIDATE: handleICECandidate(message.candidate); break;
             }
-        } catch (error) {
-            console.error('Failed to parse message:', error);
-        }
+        } catch (e) { console.error('WS Error', e); }
     }, [initiateSenderConnection, cleanupWebRTC, handleRTCOffer, handleRTCAnswer, handleICECandidate]);
 
     // ============================================================================
-    // WEBSOCKET CONNECTION
+    // APPLICATION LIFECYCLE
     // ============================================================================
 
     const connectWebSocket = useCallback(() => {
         const ws = new WebSocket('ws://localhost:8080');
         wsRef.current = ws;
-
-        ws.onopen = () => {
-            console.log('Connected to server');
-            setIsConnected(true);
-            setErrorMessage(null);
-        };
-
-        ws.onclose = () => {
-            console.log('Disconnected from server');
-            setIsConnected(false);
-        };
-
+        ws.onopen = () => { setIsConnected(true); setErrorMessage(null); };
+        ws.onclose = () => setIsConnected(false);
         ws.onmessage = handleMessage;
-
-        ws.onerror = (error) => {
-            console.error('WebSocket error:', error);
-            setErrorMessage('Connection lost. Please try again.');
-        };
-
+        ws.onerror = () => setErrorMessage('Connection lost.');
         return ws;
     }, [handleMessage]);
 
     useEffect(() => {
         if (mountedRef.current) return;
         mountedRef.current = true;
-
         connectWebSocket();
-
-        return () => {
-            mountedRef.current = false;
-            cleanupWebRTC();
-            wsRef.current?.close();
-        };
+        return () => { mountedRef.current = false; cleanupWebRTC(); wsRef.current?.close(); };
     }, [connectWebSocket, cleanupWebRTC]);
 
-    // ============================================================================
-    // ACTIONS
-    // ============================================================================
-
+    // Actions
     const handleCreateRoom = () => {
-        if (appState !== AppState.IDLE || !isConnected) return;
-        setErrorMessage(null);
+        if (appState !== AppState.IDLE) return;
         sendWsMessage(MessageType.CREATE_ROOM);
     };
-
     const handleJoinRoom = () => {
-        if (appState !== AppState.IDLE || !isConnected) return;
+        if (appState !== AppState.IDLE) return;
         setShowJoinInput(true);
-        setErrorMessage(null);
     };
-
     const handleJoinSubmit = () => {
-        const code = joinCode.trim().toUpperCase();
-        if (!code) {
-            setErrorMessage('Please enter a room code');
-            return;
-        }
-        if (code.length !== 4) {
-            setErrorMessage('Room code must be 4 characters');
-            return;
-        }
+        if (joinCode.length !== 4) return;
         setAppState(AppState.ROOM_JOINING);
-        setErrorMessage(null);
-        sendWsMessage(MessageType.JOIN_ROOM, { roomId: code });
-    };
-
-    const handleCancelJoin = () => {
-        setShowJoinInput(false);
-        setJoinCode('');
-        setErrorMessage(null);
+        sendWsMessage(MessageType.JOIN_ROOM, { roomId: joinCode });
     };
 
     const handleLeaveRoom = () => {
-        cleanupWebRTC();
-
-        if (wsRef.current) {
-            wsRef.current.close();
-            wsRef.current = null;
+        if (appState === AppState.TRANSFERRING) {
+            if (!confirm('Transfer in progress. Are you sure you want to leave?')) return;
         }
 
-        // Reset inputs
-        if (fileInputRef.current) fileInputRef.current.value = '';
-
+        cleanupWebRTC();
+        if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
         setAppState(AppState.IDLE);
         setRoomId(null);
         setUserRole(null);
-        setErrorMessage(null);
         setShowJoinInput(false);
         setJoinCode('');
-
-        setTimeout(() => {
-            connectWebSocket();
-        }, 100);
-    };
-
-    // ============================================================================
-    // STATUS TEXT
-    // ============================================================================
-
-    const getStatusText = (): string => {
-        if (statusMessage) return statusMessage;
-
-        if (appState === AppState.CONNECTED && isWebRTCConnected) {
-            return userRole === 'sender' ? 'Ready to send files' : 'Ready to receive files';
-        }
-
-        switch (appState) {
-            case AppState.ROOM_CREATED:
-                return 'Waiting for another device to join...';
-            case AppState.ROOM_JOINING:
-                return 'Joining room...';
-            case AppState.CONNECTED:
-                return 'Establishing peer-to-peer connection...';
-            default:
-                return '';
-        }
+        if (fileInputRef.current) fileInputRef.current.value = '';
+        setStatusMessage('');
+        setProgress(0);
+        setTimeout(connectWebSocket, 100);
     };
 
     // ============================================================================
     // RENDER HELPERS
     // ============================================================================
 
-    const renderRoleBadge = () => {
-        if (!userRole) return null;
-        return (
-            <div className="role-badge">
-                {userRole === 'sender' ? '📤 Sender' : '📥 Receiver'}
-            </div>
-        );
+    const getStatusText = () => {
+        if (statusMessage) return statusMessage;
+        if (appState === AppState.CONNECTED) return 'Ready to transfer files';
+        if (appState === AppState.ROOM_CREATED) return 'Waiting for peer...';
+        return '';
     };
 
-    const renderWebRTCStatus = () => {
-        if (appState !== AppState.CONNECTED) return null;
-
+    const renderProgressBar = () => {
+        if (appState !== AppState.TRANSFERRING && !canResume) return null;
         return (
-            <div className="webrtc-status">
-                <span className={`status-dot ${isWebRTCConnected ? 'connected' : 'disconnected'}`} />
-                <span>{isWebRTCConnected ? 'WebRTC connected' : 'Connecting...'}</span>
-            </div>
-        );
-    };
-
-    const renderFileTransferUI = () => {
-        if (userRole !== 'sender' || !isWebRTCConnected) return null;
-
-        return (
-            <div className="file-transfer-ui">
-                <input
-                    type="file"
-                    ref={fileInputRef}
-                    onChange={handleFileSelect}
-                    className="file-input"
-                    disabled={!isWebRTCConnected}
-                    accept="image/*,application/pdf,text/plain"
-                />
-                <button
-                    className="btn btn-primary"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={!isWebRTCConnected}
-                >
-                    Select File to Send
-                </button>
-                <p className="file-hint">Max size: 5MB</p>
-            </div>
-        );
-    };
-
-    const renderRoomView = () => (
-        <div className="room-info">
-            <div className="room-code-container">
-                <span className="room-code-label">Room Code</span>
-                <span className="room-code">{roomId}</span>
-            </div>
-
-            {renderRoleBadge()}
-
-            <p className="room-status">{getStatusText()}</p>
-
-            {renderFileTransferUI()}
-
-            {renderWebRTCStatus()}
-
-            <button
-                className="btn btn-secondary"
-                onClick={handleLeaveRoom}
-            >
-                Leave Room
-            </button>
-        </div>
-    );
-
-    const renderJoinForm = () => (
-        <div className="join-form">
-            <input
-                type="text"
-                className="join-input"
-                placeholder="XXXX"
-                value={joinCode}
-                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                onKeyDown={(e) => e.key === 'Enter' && handleJoinSubmit()}
-                maxLength={4}
-                autoFocus
-                disabled={appState === AppState.ROOM_JOINING}
-            />
-            <div className="join-actions">
-                <button
-                    className="btn btn-primary"
-                    onClick={handleJoinSubmit}
-                    disabled={!joinCode.trim() || appState === AppState.ROOM_JOINING}
-                >
-                    {appState === AppState.ROOM_JOINING ? 'Joining...' : 'Join'}
-                </button>
-                <button
-                    className="btn btn-secondary"
-                    onClick={handleCancelJoin}
-                    disabled={appState === AppState.ROOM_JOINING}
-                >
-                    Cancel
-                </button>
-            </div>
-        </div>
-    );
-
-    const renderIdleView = () => {
-        if (showJoinInput) {
-            return renderJoinForm();
-        }
-
-        return (
-            <div className="actions">
-                <button
-                    className="btn btn-primary"
-                    onClick={handleCreateRoom}
-                    disabled={!isConnected}
-                >
-                    Create Room
-                </button>
-                <button
-                    className="btn btn-secondary"
-                    onClick={handleJoinRoom}
-                    disabled={!isConnected}
-                >
-                    Join Room
-                </button>
+            <div className="progress-container">
+                <div className="progress-bar" style={{ width: `${progress}%` }} />
+                <span className="progress-text">{progress}%</span>
             </div>
         );
     };
 
     const renderContent = () => {
-        switch (appState) {
-            case AppState.ROOM_CREATED:
-            case AppState.CONNECTED:
-                return renderRoomView();
-            case AppState.ROOM_JOINING:
-                return renderJoinForm();
-            case AppState.IDLE:
-            case AppState.ERROR:
-            default:
-                return renderIdleView();
+        if (appState === AppState.IDLE) {
+            return showJoinInput ? (
+                <div className="join-form">
+                    <input className="join-input" value={joinCode} onChange={(e) => setJoinCode(e.target.value.toUpperCase())} maxLength={4} />
+                    <button className="btn btn-primary" onClick={handleJoinSubmit}>Join</button>
+                    <button className="btn btn-secondary" onClick={() => setShowJoinInput(false)}>Cancel</button>
+                </div>
+            ) : (
+                <div className="actions">
+                    <button className="btn btn-primary" onClick={handleCreateRoom} disabled={!isConnected}>Create Room</button>
+                    <button className="btn btn-secondary" onClick={handleJoinRoom} disabled={!isConnected}>Join Room</button>
+                </div>
+            );
         }
-    };
 
-    // ============================================================================
-    // MAIN RENDER
-    // ============================================================================
+        return (
+            <div className="room-info">
+                <div className="room-code-container">
+                    <span className="room-code-label">Room Code</span>
+                    <span className="room-code">{roomId}</span>
+                </div>
+
+                {userRole && (
+                    <div className="role-badge">
+                        {userRole === 'sender' ? '📤 Sender' : '📥 Receiver'}
+                    </div>
+                )}
+
+                <p className="room-status">{getStatusText()}</p>
+
+                {renderProgressBar()}
+
+                {canResume && (
+                    <button className="btn btn-primary" onClick={handleResume}>
+                        Resume Transfer
+                    </button>
+                )}
+
+                {userRole === 'sender' && appState === AppState.CONNECTED && (
+                    <div className="file-transfer-ui">
+                        <input type="file" ref={fileInputRef} onChange={handleFileSelect} className="file-input" />
+                        <button className="btn btn-primary" onClick={() => fileInputRef.current?.click()}>
+                            Select File
+                        </button>
+                    </div>
+                )}
+
+                <div className="webrtc-status">
+                    <span className={`status-dot ${isWebRTCConnected ? 'connected' : 'disconnected'}`} />
+                    <span>{isWebRTCConnected ? 'WebRTC connected' : 'Connecting...'}</span>
+                </div>
+
+                <button className="btn btn-secondary" onClick={handleLeaveRoom}>Leave Room</button>
+            </div>
+        );
+    };
 
     return (
         <div className="container">
@@ -720,27 +756,12 @@ function App() {
                 <h1 className="title">Fusion Share</h1>
                 <p className="subtitle">Cross-device file sharing</p>
             </header>
-
             <div className="status">
                 <span className={`status-dot ${isConnected ? 'connected' : 'disconnected'}`} />
-                <span className="status-text">
-                    {isConnected ? 'Connected' : 'Connecting...'}
-                </span>
+                <span className="status-text">{isConnected ? 'Connected' : 'Reconnecting...'}</span>
             </div>
-
-            {errorMessage && (
-                <div className="error-message" role="alert">
-                    {errorMessage}
-                </div>
-            )}
-
-            <main className="main-content">
-                {renderContent()}
-            </main>
-
-            <footer className="footer">
-                <p>Works on Android, iOS & Desktop</p>
-            </footer>
+            {errorMessage && <div className="error-message">{errorMessage}</div>}
+            <main className="main-content">{renderContent()}</main>
         </div>
     );
 }
