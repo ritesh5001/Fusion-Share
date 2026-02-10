@@ -78,10 +78,26 @@ interface TransferState {
     chunks: (string | ArrayBuffer | null)[]; // Allow null for memory clearing
     currentChunkIndex: number;
     startTime: number;
+    // Sliding window (sender side)
+    lastAckedChunkIndex: number;   // highest consecutively ACKed chunk (-1 initially)
+    inFlightChunks: Set<number>;   // indices of chunks sent but not yet ACKed
+    windowSize: number;            // active window size
 }
 
 const CHUNK_SIZE = 16 * 1024; // 16KB safe chunk size
 const DATA_CHANNEL_NAME = 'fusion-share';
+
+// Sliding Window Configuration
+const BUFFER_THRESHOLD = 256 * 1024; // 256KB — pause sending when DataChannel buffer exceeds this
+const DEFAULT_WINDOW_SIZE = 4;
+const MAX_WINDOW_SIZE = 8;
+
+// Adaptive: Safari gets a conservative window, others get more aggressive
+const getWindowSize = (): number => {
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+    const size = isSafari ? DEFAULT_WINDOW_SIZE : 6;
+    return Math.min(size, MAX_WINDOW_SIZE);
+};
 
 // Friendly error messages
 const ERROR_MESSAGES: Record<string, string> = {
@@ -229,8 +245,13 @@ function App() {
                 totalChunks,
                 chunks,
                 currentChunkIndex: 0,
-                startTime: Date.now()
+                startTime: Date.now(),
+                lastAckedChunkIndex: -1,
+                inFlightChunks: new Set<number>(),
+                windowSize: getWindowSize(),
             };
+
+            log(`[Transfer] Window size = ${transferRef.current.windowSize}`);
 
             // Send Metadata
             const meta: FileMeta = {
@@ -247,7 +268,7 @@ function App() {
             dataChannelRef.current.send(JSON.stringify(meta));
 
             // Start sending chunks
-            sendNextChunk();
+            sendChunks();
 
         } catch (error) {
             console.error('[FusionShare] Error preparing file:', error);
@@ -257,59 +278,67 @@ function App() {
     };
 
     /**
-     * Sends the next chunk in the queue
+     * Sends chunks using a sliding window — fills up to windowSize in-flight chunks.
+     * Replaces the old stop-and-wait sendNextChunk().
      */
-    const sendNextChunk = () => {
+    const sendChunks = () => {
         const transfer = transferRef.current;
-        if (!transfer || !dataChannelRef.current) return;
+        const dc = dataChannelRef.current;
+        if (!transfer || !dc || dc.readyState !== 'open') return;
 
-        // Check for completion
-        if (transfer.currentChunkIndex >= transfer.totalChunks) {
-            log('Transfer complete');
+        // Completion check — all chunks ACKed
+        if (transfer.lastAckedChunkIndex >= transfer.totalChunks - 1) {
+            log('[Transfer] Transfer complete');
             setStatusMessage(`Sent ${transfer.fileName} successfully!`);
             setAppState(AppState.CONNECTED);
             wakeLock.release();
             if (fileInputRef.current) fileInputRef.current.value = '';
-
-            // Cleanup memory (chunks array is already mostly nullified by now)
             transfer.chunks = [];
             return;
         }
 
-        const chunkIndex = transfer.currentChunkIndex;
-
-        // Memory optimization: Free previous chunk as it's been acknowledged
-        if (chunkIndex > 0) {
-            transfer.chunks[chunkIndex - 1] = null;
-        }
-
-        const chunkData = transfer.chunks[chunkIndex] as string;
-
-        // Verify chunk exists (in case of resume logic quirks)
-        if (!chunkData) {
-            console.error('[FusionShare] Chunk data missing for index', chunkIndex);
+        // Backpressure: pause if DataChannel buffer is overfull
+        if (dc.bufferedAmount > BUFFER_THRESHOLD) {
+            log(`[Transfer] Backpressure — bufferedAmount=${dc.bufferedAmount}, pausing`);
+            setTimeout(() => sendChunks(), 50);
             return;
         }
 
-        const message: ChunkMessage = {
-            type: 'FILE_CHUNK',
-            fileId: transfer.fileId,
-            index: chunkIndex,
-            data: chunkData
-        };
+        // Fill the window
+        while (
+            transfer.inFlightChunks.size < transfer.windowSize &&
+            transfer.currentChunkIndex < transfer.totalChunks
+        ) {
+            const idx = transfer.currentChunkIndex;
+            const chunkData = transfer.chunks[idx] as string;
 
-        try {
-            dataChannelRef.current.send(JSON.stringify(message));
+            // Verify chunk exists (in case of resume logic quirks)
+            if (!chunkData) {
+                console.error('[FusionShare][Transfer] Chunk data missing for index', idx);
+                return;
+            }
 
-            // Update UI
-            const percent = Math.round(((chunkIndex + 1) / transfer.totalChunks) * 100);
-            setProgress(percent);
-            setStatusMessage(`Sending... ${percent}%`);
-        } catch (e) {
-            console.error('[FusionShare] Failed to send chunk', e);
-            setCanResume(true);
-            setStatusMessage('Transfer interrupted');
+            const message: ChunkMessage = {
+                type: 'FILE_CHUNK',
+                fileId: transfer.fileId,
+                index: idx,
+                data: chunkData,
+            };
+
+            try {
+                dc.send(JSON.stringify(message));
+                transfer.inFlightChunks.add(idx);
+                log(`[Transfer] Sent chunk ${idx}`);
+                transfer.currentChunkIndex++;
+            } catch (e) {
+                console.error('[FusionShare][Transfer] Failed to send chunk', idx, e);
+                setCanResume(true);
+                setStatusMessage('Transfer interrupted');
+                return;
+            }
         }
+
+        log(`[Transfer] Window size = ${transfer.windowSize}, in-flight = ${transfer.inFlightChunks.size}`);
     };
 
     /**
@@ -327,10 +356,27 @@ function App() {
                 const transfer = transferRef.current;
 
                 if (transfer && transfer.fileId === ack.fileId) {
-                    if (ack.index === transfer.currentChunkIndex) {
-                        transfer.currentChunkIndex++;
-                        sendNextChunk();
+                    log(`[Transfer] ACK received for chunk ${ack.index}`);
+                    transfer.inFlightChunks.delete(ack.index);
+
+                    // Free memory for ACKed chunk
+                    transfer.chunks[ack.index] = null;
+
+                    // Advance lastAckedChunkIndex (consecutive ACKs)
+                    while (
+                        transfer.lastAckedChunkIndex < transfer.totalChunks - 1 &&
+                        transfer.chunks[transfer.lastAckedChunkIndex + 1] === null
+                    ) {
+                        transfer.lastAckedChunkIndex++;
                     }
+
+                    // Progress based on ACKed chunks (not sent)
+                    const percent = Math.round(((transfer.lastAckedChunkIndex + 1) / transfer.totalChunks) * 100);
+                    setProgress(percent);
+                    setStatusMessage(`Sending... ${percent}%`);
+
+                    // Try to send more chunks
+                    sendChunks();
                 }
                 return;
             }
@@ -340,9 +386,11 @@ function App() {
                 const transfer = transferRef.current;
 
                 if (transfer && transfer.fileId === req.fileId) {
-                    log(`Resuming from chunk ${req.lastReceivedChunk + 1}`);
+                    log(`[Transfer] Resuming from chunk ${req.lastReceivedChunk + 1}`);
                     transfer.currentChunkIndex = req.lastReceivedChunk + 1;
-                    sendNextChunk();
+                    transfer.lastAckedChunkIndex = req.lastReceivedChunk;
+                    transfer.inFlightChunks.clear();
+                    sendChunks();
                 }
                 return;
             }
@@ -369,7 +417,10 @@ function App() {
                     totalChunks: meta.totalChunks,
                     chunks: [],
                     currentChunkIndex: 0,
-                    startTime: Date.now()
+                    startTime: Date.now(),
+                    lastAckedChunkIndex: -1,
+                    inFlightChunks: new Set<number>(),
+                    windowSize: DEFAULT_WINDOW_SIZE,
                 };
 
                 setAppState(AppState.TRANSFERRING);
@@ -459,8 +510,9 @@ function App() {
         }
 
         if (userRole === 'sender') {
-            log('Retrying current chunk...');
-            sendNextChunk();
+            log('[Transfer] Retrying — resetting in-flight state');
+            transfer.inFlightChunks.clear();
+            sendChunks();
             setCanResume(false);
         }
     };
