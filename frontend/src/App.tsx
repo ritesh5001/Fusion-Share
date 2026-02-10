@@ -106,6 +106,8 @@ const RTC_CONFIG: RTCConfiguration = {
 // Helper to generate UUID
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
+import { InstallPrompt } from './components/InstallPrompt';
+
 // ============================================================================
 // COMPONENT
 // ============================================================================
@@ -884,6 +886,7 @@ function App() {
             </div>
             {errorMessage && <div className="error-message">{errorMessage}</div>}
             <main className="main-content">{renderContent()}</main>
+            <InstallPrompt />
         </div>
     );
 }
