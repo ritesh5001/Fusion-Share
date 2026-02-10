@@ -67,8 +67,27 @@ const wss = new WebSocketServer({ port: PORT });
 
 console.log(`WebSocket server running on port ${PORT}`);
 
-wss.on('connection', (ws: WebSocket) => {
+// Heartbeat: ping all clients every 30s to keep connections alive through proxies
+const HEARTBEAT_INTERVAL = 30_000;
+const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws: WebSocket & { isAlive?: boolean }) => {
+        if (ws.isAlive === false) {
+            console.log('Terminating unresponsive client');
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, HEARTBEAT_INTERVAL);
+
+wss.on('close', () => {
+    clearInterval(heartbeat);
+});
+
+wss.on('connection', (ws: WebSocket & { isAlive?: boolean }) => {
     console.log('Client connected');
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data: Buffer) => {
         try {
