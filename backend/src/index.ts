@@ -1,6 +1,7 @@
+import 'dotenv/config';
 import { WebSocketServer, WebSocket } from 'ws';
 
-const PORT = 8080;
+const PORT = Number(process.env.PORT) || 8080;
 
 // Message types
 enum MessageType {

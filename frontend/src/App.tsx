@@ -640,7 +640,8 @@ function App() {
     // ============================================================================
 
     const connectWebSocket = useCallback(() => {
-        const ws = new WebSocket('ws://localhost:8080');
+        const wsUrl = import.meta.env.VITE_WS_URL || 'ws://localhost:8080';
+        const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
         ws.onopen = () => { setIsConnected(true); setErrorMessage(null); };
         ws.onclose = () => setIsConnected(false);
