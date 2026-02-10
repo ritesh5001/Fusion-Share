@@ -3,7 +3,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 const PORT = Number(process.env.PORT) || 8080;
 
-// Message types
+
 enum MessageType {
     // Room management
     CREATE_ROOM = 'CREATE_ROOM',
