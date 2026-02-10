@@ -1,4 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
+import QRCode from 'qrcode';
+import { Html5QrcodeScanner } from 'html5-qrcode';
 
 // ============================================================================
 // TYPES & CONSTANTS
@@ -123,6 +125,10 @@ function App() {
     const [progress, setProgress] = useState<number>(0);
     const [canResume, setCanResume] = useState(false);
 
+    // QR Code state
+    const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
+    const [showScanner, setShowScanner] = useState(false);
+
     // WebRTC state
     const [isWebRTCConnected, setIsWebRTCConnected] = useState(false);
 
@@ -132,6 +138,7 @@ function App() {
     const dataChannelRef = useRef<RTCDataChannel | null>(null);
     const mountedRef = useRef(false);
     const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+    const scannerRef = useRef<Html5QrcodeScanner | null>(null);
 
     // Transfer Refs
     const transferRef = useRef<TransferState | null>(null);
@@ -638,6 +645,100 @@ function App() {
         return () => { mountedRef.current = false; cleanupWebRTC(); wsRef.current?.close(); };
     }, [connectWebSocket, cleanupWebRTC]);
 
+    // ============================================================================
+    // QR CODE & URL LOGIC
+    // ============================================================================
+
+    // 1. Generate QR Code for Sender
+    useEffect(() => {
+        if (userRole === 'sender' && roomId) {
+            const url = `${window.location.protocol}//${window.location.host}?room=${roomId}`;
+            QRCode.toDataURL(url, { margin: 1, width: 200 })
+                .then(setQrCodeUrl)
+                .catch(err => console.error('[FusionShare] QR Generation Error:', err));
+        } else {
+            setQrCodeUrl('');
+        }
+    }, [userRole, roomId]);
+
+    // 2. Parse URL for Auto-Join
+    useEffect(() => {
+        const params = new URLSearchParams(window.location.search);
+        const roomParam = params.get('room');
+        if (roomParam && isConnected && appState === AppState.IDLE) {
+            log('Auto-joining room from URL:', roomParam);
+            setJoinCode(roomParam);
+            // Small delay to ensure state updates
+            setTimeout(() => {
+                setAppState(AppState.ROOM_JOINING);
+                sendWsMessage(MessageType.JOIN_ROOM, { roomId: roomParam });
+                // Clean URL
+                window.history.replaceState({}, '', '/');
+            }, 100);
+        }
+    }, [isConnected, appState, sendWsMessage]);
+
+    // 3. Scanner Logic
+    const startScanner = () => {
+        setShowScanner(true);
+        // Defer scanner init to ensure DOM element exists
+        setTimeout(() => {
+            if (!scannerRef.current) {
+                const scanner = new Html5QrcodeScanner(
+                    "reader",
+                    { fps: 10, qrbox: { width: 250, height: 250 } },
+                    /* verbose= */ false
+                );
+                scannerRef.current = scanner;
+
+                scanner.render(
+                    (decodedText) => {
+                        log('QR Code scanned:', decodedText);
+                        handleScanSuccess(decodedText);
+                    },
+                    (_) => {
+                        // ignore scan errors, they happen on every frame
+                    }
+                );
+            }
+        }, 100);
+    };
+
+    const stopScanner = () => {
+        if (scannerRef.current) {
+            scannerRef.current.clear().catch(console.error);
+            scannerRef.current = null;
+        }
+        setShowScanner(false);
+    };
+
+    const handleScanSuccess = (decodedText: string) => {
+        stopScanner();
+        try {
+            // Try to parse URL param
+            let code = decodedText;
+            if (decodedText.includes('?room=')) {
+                const url = new URL(decodedText);
+                code = url.searchParams.get('room') || '';
+            }
+
+            if (code && code.length === 4) {
+                setJoinCode(code);
+                setAppState(AppState.ROOM_JOINING);
+                sendWsMessage(MessageType.JOIN_ROOM, { roomId: code });
+            } else {
+                setErrorMessage('Invalid QR Code');
+            }
+        } catch (e) {
+            console.error('QR Parse Error', e);
+            setErrorMessage('Invalid QR Code');
+        }
+    };
+
+    // ============================================================================
+    // ACTIONS & RENDER
+    // ============================================================================
+
     // Actions
     const handleCreateRoom = () => {
         if (appState !== AppState.IDLE) return;
@@ -658,6 +759,7 @@ function App() {
             if (!confirm('Transfer in progress. Are you sure you want to leave?')) return;
         }
 
+        stopScanner();
         cleanupWebRTC();
         if (wsRef.current) { wsRef.current.close(); wsRef.current = null; }
         setAppState(AppState.IDLE);
@@ -693,12 +795,25 @@ function App() {
     };
 
     const renderContent = () => {
+        // Scanner Overlay
+        if (showScanner) {
+            return (
+                <div className="scanner-overlay">
+                    <div id="reader" className="scanner-box"></div>
+                    <button className="btn btn-secondary mt-4" onClick={stopScanner}>Cancel Scan</button>
+                </div>
+            );
+        }
+
         if (appState === AppState.IDLE) {
             return showJoinInput ? (
                 <div className="join-form">
                     <input className="join-input" value={joinCode} onChange={(e) => setJoinCode(e.target.value.toUpperCase())} maxLength={4} />
                     <button className="btn btn-primary" onClick={handleJoinSubmit}>Join</button>
-                    <button className="btn btn-secondary" onClick={() => setShowJoinInput(false)}>Cancel</button>
+                    <div className="scanner-actions">
+                        <button className="btn btn-secondary" onClick={startScanner}>📷 Scan QR</button>
+                        <button className="btn btn-secondary" onClick={() => { setShowScanner(false); setShowJoinInput(false); }}>Cancel</button>
+                    </div>
                 </div>
             ) : (
                 <div className="actions">
@@ -714,6 +829,13 @@ function App() {
                     <span className="room-code-label">Room Code</span>
                     <span className="room-code">{roomId}</span>
                 </div>
+
+                {qrCodeUrl && (
+                    <div className="qr-code-container">
+                        <img src={qrCodeUrl} alt="Room QR Code" className="qr-code-image" />
+                        <p className="qr-hint">Scan to join instantly</p>
+                    </div>
+                )}
 
                 {userRole && (
                     <div className="role-badge">
