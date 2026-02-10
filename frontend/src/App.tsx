@@ -107,6 +107,7 @@ const RTC_CONFIG: RTCConfiguration = {
 const generateId = () => Math.random().toString(36).substring(2, 15);
 
 import { InstallPrompt } from './components/InstallPrompt';
+import { useWakeLock } from './hooks/useWakeLock';
 
 // ============================================================================
 // COMPONENT
@@ -141,6 +142,9 @@ function App() {
     const mountedRef = useRef(false);
     const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
     const scannerRef = useRef<Html5QrcodeScanner | null>(null);
+
+    // Wake Lock
+    const wakeLock = useWakeLock();
 
     // Transfer Refs
     const transferRef = useRef<TransferState | null>(null);
@@ -201,6 +205,7 @@ function App() {
         setCanResume(false);
         setAppState(AppState.TRANSFERRING);
         setStatusMessage(`Preparing ${file.name}...`);
+        wakeLock.request();
 
         try {
             const buffer = await file.arrayBuffer();
@@ -263,6 +268,7 @@ function App() {
             log('Transfer complete');
             setStatusMessage(`Sent ${transfer.fileName} successfully!`);
             setAppState(AppState.CONNECTED);
+            wakeLock.release();
             if (fileInputRef.current) fileInputRef.current.value = '';
 
             // Cleanup memory (chunks array is already mostly nullified by now)
@@ -369,6 +375,7 @@ function App() {
                 setAppState(AppState.TRANSFERRING);
                 setProgress(0);
                 setStatusMessage(`Receiving ${meta.name}...`);
+                wakeLock.request();
                 return;
             }
 
@@ -424,6 +431,7 @@ function App() {
                     }
 
                     setAppState(AppState.CONNECTED);
+                    wakeLock.release();
                     transferRef.current = null; // Clear memory
                 }
                 return;
@@ -463,6 +471,7 @@ function App() {
 
     const cleanupWebRTC = useCallback(() => {
         log('Cleaning up WebRTC');
+        wakeLock.release();
         if (dataChannelRef.current) {
             dataChannelRef.current.close();
         }
@@ -757,6 +766,7 @@ function App() {
     };
 
     const handleLeaveRoom = () => {
+        wakeLock.release();
         if (appState === AppState.TRANSFERRING) {
             if (!confirm('Transfer in progress. Are you sure you want to leave?')) return;
         }
@@ -848,6 +858,10 @@ function App() {
                 <p className="room-status">{getStatusText()}</p>
 
                 {renderProgressBar()}
+
+                {wakeLock.isActive && appState === AppState.TRANSFERRING && (
+                    <p className="wake-lock-status">Keeping screen awake during transfer</p>
+                )}
 
                 {canResume && (
                     <button className="btn btn-primary" onClick={handleResume}>

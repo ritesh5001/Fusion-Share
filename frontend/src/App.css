@@ -419,3 +419,17 @@ html, body {
   display: none; /* Hide default placeholder */
 }
 
+/* Wake Lock status indicator */
+.wake-lock-status {
+  font-size: clamp(0.625rem, 2vw, 0.75rem);
+  color: var(--text-secondary);
+  opacity: 0.7;
+  text-align: center;
+  animation: wakeLockFadeIn 0.4s ease-out;
+}
+
+@keyframes wakeLockFadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 0.7; transform: translateY(0); }
+}
+
