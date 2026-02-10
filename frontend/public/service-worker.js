@@ -1,4 +1,4 @@
-const CACHE_NAME = 'fusion-share-v1';
+const CACHE_NAME = 'fusion-share-v2';
 const ASSETS_TO_CACHE = [
     '/',
     '/index.html',
@@ -6,11 +6,17 @@ const ASSETS_TO_CACHE = [
     '/icon.svg'
 ];
 
-// Install event: cache static assets
+// Install event: cache static assets (resilient — skips assets that fail to fetch)
 self.addEventListener('install', (event) => {
     event.waitUntil(
         caches.open(CACHE_NAME).then((cache) => {
-            return cache.addAll(ASSETS_TO_CACHE);
+            return Promise.allSettled(
+                ASSETS_TO_CACHE.map((url) =>
+                    cache.add(url).catch((err) => {
+                        console.warn(`[SW] Failed to cache: ${url}`, err);
+                    })
+                )
+            );
         })
     );
     self.skipWaiting();
@@ -51,10 +57,13 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
-    // 3. Static assets: Cache first
+    // 3. Static assets: Cache first, network fallback, graceful failure
     event.respondWith(
         caches.match(event.request).then((response) => {
-            return response || fetch(event.request);
+            return response || fetch(event.request).catch(() => {
+                // Both cache and network failed — return a basic offline response
+                return new Response('', { status: 408, statusText: 'Offline' });
+            });
         })
     );
 });
